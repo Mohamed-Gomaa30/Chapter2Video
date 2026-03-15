@@ -35,22 +35,18 @@ def main():
     
     print("Step 3: Extracting Zones and Assets...")
     final_data = []
-    globally_extracted_figures = set()  # Track extracted figures across all sections
+    globally_extracted_figures = set()  
     for section in sections:
         print(f"Processing Section {section.section_id}: {section.title}...")
         
-        # Extract zone images first (needed for both VLM figures and VLM text)
         zone_images = extractor.extract_section_zones(section)
 
-        # Figure Extraction
         if args.vlm_figures and transcriber:
             extractor.extract_assets_with_vlm(section, transcriber, zone_images, globally_extracted_figures)
         else:
-            # Fallback to standard PyMuPDF image extraction
             extractor.extract_assets_in_zone(section)
 
         
-        # Transcribe zones if VLM is enabled
         if args.vlm and transcriber:
             import time
             transcribed_texts = []
@@ -58,7 +54,6 @@ def main():
                 print(f"  Transcribing {os.path.basename(zone_img)}...")
                 text = transcriber.transcribe_zone(zone_img)
                 transcribed_texts.append(text)
-                # Sleep to avoid rate limits
                 time.sleep(4) 
             section.text = "\n\n".join(transcribed_texts)
         else:

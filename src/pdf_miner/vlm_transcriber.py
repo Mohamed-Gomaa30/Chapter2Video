@@ -8,12 +8,12 @@ from camel.types import ModelType, ModelPlatformType
 
 class VLMTranscriber:
     def __init__(self, model_platform: ModelPlatformType = ModelPlatformType.GEMINI, 
-                 model_type: ModelType = ModelType.GEMINI_2_0_FLASH):
+                 model_type: ModelType = ModelType.GEMINI_3_PRO):
         self.model = ModelFactory.create(
             model_platform=model_platform,
             model_type=model_type,
         )
-        self.agent = ChatAgent(system_message="You are a technical document transcriber.", model=self.model)
+        self.system_message = "You are a technical document transcriber."
 
     def transcribe_zone(self, image_path: str) -> str:
         """Sends a zone image to the VLM and returns transcribed LaTeX text."""
@@ -33,27 +33,25 @@ Output: Return ONLY the transcribed text string."""
             image_list=[Image.open(image_path)]
         )
         
-        response = self.agent.step(user_msg)
+        agent = ChatAgent(system_message=self.system_message, model=self.model)
+        response = agent.step(user_msg)
         if response.msg is None:
-            return ""  # Model returned empty response (e.g. figure-only page)
+            return ""  
         return response.msg.content.strip()
+
     def detect_figures(self, image_path: str) -> str:
         """Prompts the VLM to identify visual-only figure blocks and return JSON coordinates."""
-        prompt = """Analyze this image and identify all visual diagrams, illustrations, charts, or figures.
-        
-        CRITICAL: Your bounding box MUST encompass the ACTUAL visual diagram/drawing content. 
-        - Do NOT return a box that only contains a text label or caption.
-        - The box SHOULD include both the visual diagram and its associated caption text.
-        
-        For each figure, return its bounding box in normalized [ymin, xmin, ymax, xmax] format (0-1000).
-        
-        Return ONLY a JSON list:
-        [
-          {"caption_hint": "Actual caption text if visible", "bbox": [ymin, xmin, ymax, xmax]},
-          ...
-        ]
-        If no figures are found, return '[]'."""
+        prompt = """Analyze this image and identify all visual diagrams, illustrations, charts, or technical figures.
 
+        CRITICAL: Identify only units that have ACTUAL visual content like drawings, diagrams, charts, plots, or table structures.
+        - DO NOT box items that are PURELY TEXT, even if they are labeled "Figure X.Y" or "Table Z".
+        - A figure must be a visually distinct 'ISLAND' containing non-textual elements (lines, boxes, arrows, shapes).
+        - IGNORE body text paragraphs and simple section headers.
+        - If a visual diagram exists, you MUST include its associated Master Caption in the box.
+        - The box must be 'TIGHT' around the visual/caption unit.
+
+        Return ONLY a JSON list of objects, each with "caption_hint" (the text of the label) and "bbox" in normalized [ymin, xmin, ymax, xmax] format (0-1000).
+        If no figures are found, return '[]'."""
         
         user_msg = BaseMessage.make_user_message(
             role_name="User",
@@ -61,7 +59,9 @@ Output: Return ONLY the transcribed text string."""
             image_list=[Image.open(image_path)]
         )
         
-        response = self.agent.step(user_msg)
+        # Create a fresh agent for each call to prevent history contamination
+        agent = ChatAgent(system_message=self.system_message, model=self.model)
+        response = agent.step(user_msg)
         if response.msg is None:
             return "[]"
         return response.msg.content.strip()

@@ -5,27 +5,44 @@ from typing import List, Dict, Any
 from models import Section, Figure
 
 class PDFExtractor:
-    def __init__(self, pdf_path: str, index_path: str, output_dir: str):
+    def __init__(self, pdf_path: str, index_path: str, output_dir: str, 
+                 dpi: int = 300, 
+                 vlm_dpi: int = 200,
+                 bridge_margin_y: int = 20,
+                 bridge_margin_x: int = 10,
+                 padding: int = 5):
         self.pdf_path = pdf_path
         self.index_path = index_path
         self.output_dir = output_dir
+        self.dpi = dpi
+        self.vlm_dpi = vlm_dpi
+        self.bridge_margin_y = bridge_margin_y
+        self.bridge_margin_x = bridge_margin_x
+        self.padding = padding
+        
         self.figures_dir = os.path.join(output_dir, "figures")
         os.makedirs(self.figures_dir, exist_ok=True)
         self.doc = fitz.open(pdf_path)
+        self._vlm_cache = {} 
 
     def parse_index(self) -> List[Dict[str, Any]]:
-        """Parses index.txt into a list of dictionaries with section_id and title."""
+        """Parses index.txt into a list of dictionaries. 
+        Supports various formats: '1.1 Title', 'Chapter 1 Title', 'Section 1.2 Title'.
+        """
         sections = []
         with open(self.index_path, 'r') as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                match = re.match(r'^([\d\.]+)\s+(.+)$', line)
+                match = re.match(r'^((?:(?:Chapter|Section|Part)\s+)?[\d\w\.]+)\s*(.*)$', line, re.IGNORECASE)
                 if match:
-                    section_id = match.group(1)
+                    section_id = match.group(1).strip()
                     title = match.group(2).strip()
-                    level = section_id.count('.')
+                    if not title:
+                        title = section_id
+                    
+                    level = section_id.count('.') + (1 if ' ' in section_id else 0)
                     sections.append({
                         "section_id": section_id,
                         "title": title,
@@ -56,6 +73,9 @@ class PDFExtractor:
                         block_text = b[4].strip().replace('\n', ' ')
                         
                         if re.match(id_pattern, block_text):
+                            if b[1] < 50 or b[3] > self.doc[page_num].rect.height - 50:
+                                continue
+
                             if title.lower() in block_text.lower():
                                 if re.search(r'\.{3,}\s*\d', block_text):
                                     continue
@@ -109,7 +129,7 @@ class PDFExtractor:
                 continue
                 
             clip_rect = fitz.Rect(0, y0, page.rect.width, y1)
-            pix = page.get_pixmap(clip=clip_rect, dpi=300)
+            pix = page.get_pixmap(clip=clip_rect, dpi=self.dpi)
             
             img_name = f"section_{section.section_id}_p{page_num}.png"
             img_path = os.path.join(self.output_dir, "zones", img_name)
@@ -160,54 +180,63 @@ class PDFExtractor:
                         bbox=list(bbox)
                     ))
 
-    def get_pages_with_images(self, section: Section) -> Dict[int, bool]:
-        """Uses PyMuPDF to quickly check which pages in this section have images."""
-        pages_with_images = {}
+    def get_pages_with_visual_content(self, section: Section) -> Dict[int, bool]:
+        """Checks if pages have raster images, vector drawings, or 'Figure' hints."""
+        pages_visual = {}
         for page_num in range(section.page_start, section.page_end + 1):
             page = self.doc[page_num]
-            images = page.get_images(full=True)
-            pages_with_images[page_num] = len(images) > 0
-        return pages_with_images
+            has_img = len(page.get_images()) > 0
+            has_vec = len(page.get_drawings()) > 5 
+            has_fig_text = "figure" in page.get_text().lower()
+            
+            pages_visual[page_num] = has_img or has_vec or has_fig_text
+        return pages_visual
 
     def extract_assets_with_vlm(self, section: Section, transcriber: Any, 
                                  zone_images: List[str],
                                  globally_extracted: set):
-        """Uses VLM to visually identify figures via coordinates, then refines
-        those coordinates with PyMuPDF object bounding boxes for pixel-perfect crops.
+        """Pivots to full-page VLM scanning for better context.
+        Uses spatial filtering to attribute detected figures to the current section.
         """
         import json
         import time
 
-        pages_with_images = self.get_pages_with_images(section)
+        if not hasattr(self, '_vlm_cache'):
+            self._vlm_cache = {} 
+
+        pages_visual = self.get_pages_with_visual_content(section)
         
-        zones_to_scan = []
-        for zone_path in zone_images:
-            page_match = re.search(r'_p(\d+)', os.path.basename(zone_path))
-            if page_match:
-                page_num = int(page_match.group(1))
-                if pages_with_images.get(page_num, False):
-                    zones_to_scan.append((zone_path, page_num))
+        pages_to_scan = [p for p in range(section.page_start, section.page_end + 1) if pages_visual.get(p, False)]
         
-        if not zones_to_scan:
-            print(f"    No visual objects detected (PyMuPDF pre-filter).")
+        if not pages_to_scan:
+            print(f"    No visual objects detected (Smart pre-filter).")
             return
 
-        for zone_path, page_num in zones_to_scan:
-            print(f"  VLM visually scanning {os.path.basename(zone_path)}...")
-            vlm_json = transcriber.detect_figures(zone_path)
-            time.sleep(2)
-
-            try:
-                json_str = vlm_json.strip()
-                if "```json" in json_str:
-                    json_str = json_str.split("```json")[1].split("```")[0].strip()
-                elif "```" in json_str:
-                    json_str = json_str.split("```")[1].split("```")[0].strip()
+        for page_num in pages_to_scan:
+            if page_num in self._vlm_cache:
+                detected_figures = self._vlm_cache[page_num]
+            else:
+                print(f"  VLM scanning FULL PAGE {page_num} for context...")
+                page = self.doc[page_num]
+                pix = page.get_pixmap(dpi=self.vlm_dpi)
+                temp_page_path = os.path.join(self.output_dir, "temp_full_page.png")
+                pix.save(temp_page_path)
                 
-                detected_figures = json.loads(json_str)
-            except Exception as e:
-                print(f"    Error parsing VLM JSON for {os.path.basename(zone_path)}: {e}")
-                continue
+                vlm_json = transcriber.detect_figures(temp_page_path)
+                time.sleep(2)
+
+                try:
+                    json_str = vlm_json.strip()
+                    if "```json" in json_str:
+                        json_str = json_str.split("```json")[1].split("```")[0].strip()
+                    elif "```" in json_str:
+                        json_str = json_str.split("```")[1].split("```")[0].strip()
+                    
+                    detected_figures = json.loads(json_str)
+                    self._vlm_cache[page_num] = detected_figures
+                except Exception as e:
+                    print(f"    Error parsing VLM JSON for page {page_num}: {e}")
+                    continue
 
             if not detected_figures:
                 continue
@@ -217,58 +246,88 @@ class PDFExtractor:
             
             zone_y_start = section.y_start if page_num == section.page_start else 0
             zone_y_end = section.y_end if page_num == section.page_end else ph
-            zone_height = zone_y_end - zone_y_start
 
             for fig_data in detected_figures:
-                v_ymin, v_xmin, v_ymax, v_xmax = fig_data['bbox']
-                caption_hint = fig_data.get('caption_hint', 'Unlabeled figure')
-
-                if caption_hint in globally_extracted:
+                bbox = fig_data.get('bbox')
+                
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 1 and isinstance(bbox[0], (list, tuple)):
+                    bbox = bbox[0]
+                
+                if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    print(f"    ⚠ Skipping malformed figure data (bbox: {bbox})")
                     continue
+                    
+                v_ymin, v_xmin, v_ymax, v_xmax = bbox
+                caption_hint = fig_data.get('caption_hint')
+                if not caption_hint:
+                    caption_hint = "Unlabeled figure"
 
-                pdf_ymin = zone_y_start + (v_ymin / 1000.0) * zone_height
-                pdf_ymax = zone_y_start + (v_ymax / 1000.0) * zone_height
+                pdf_ymin = (v_ymin / 1000.0) * ph
+                pdf_ymax = (v_ymax / 1000.0) * ph
                 pdf_xmin = (v_xmin / 1000.0) * pw
                 pdf_xmax = (v_xmax / 1000.0) * pw
                 
-                vlm_rect = fitz.Rect(pdf_xmin, pdf_ymin, pdf_xmax, pdf_ymax)
+                fig_center_y = (pdf_ymin + pdf_ymax) / 2
+                if not (zone_y_start <= fig_center_y <= zone_y_end):
+                    continue
 
+                if caption_hint in globally_extracted and caption_hint != "Unlabeled figure":
+                    continue
+
+                vlm_rect = fitz.Rect(pdf_xmin, pdf_ymin, pdf_xmax, pdf_ymax)
+                
+                visual_objects = []
                 img_info = page.get_image_info(xrefs=True)
-                candidate_rects = []
                 for info in img_info:
                     obj_rect = fitz.Rect(info['bbox'])
-                    if obj_rect.intersects(vlm_rect):
-                        candidate_rects.append(obj_rect)
+                    if obj_rect.intersects(vlm_rect): visual_objects.append(obj_rect)
                 
-                if candidate_rects:
-                    final_rect = candidate_rects[0]
-                    for r in candidate_rects[1:]:
-                        final_rect |= r
-                    final_rect.y0 = max(0, final_rect.y0 - 10)
-                    final_rect.y1 = min(ph, final_rect.y1 + 10)
-                else:
-                    final_rect = vlm_rect
+                drawings = page.get_drawings()
+                for d in drawings:
+                    d_rect = fitz.Rect(d['rect'])
+                    if d_rect.intersects(vlm_rect) and 5 < d_rect.width < pw * 0.95: 
+                        visual_objects.append(d_rect)
 
-                final_rect.y0 = max(zone_y_start, final_rect.y0)
-                final_rect.y1 = min(zone_y_end, final_rect.y1)
+                caption_blocks = []
                 blocks = page.get_text("blocks")
-                caption_bottom = final_rect.y1  
+                clean_hint = str(caption_hint).lower() if caption_hint else ""
+                
                 for b in blocks:
-                    if len(b) >= 7 and b[6] == 0:  
-                        b_top, b_bottom = b[1], b[3]
-                        if final_rect.y1 <= b_top <= final_rect.y1 + 60:
-                            block_text = b[4].strip()
-                            if re.match(r'Figure\s+\d+', block_text, re.IGNORECASE):
-                                caption_bottom = b_bottom + 5  
-                                break
-                final_rect.y1 = min(zone_y_end, caption_bottom)
+                    if len(b) >= 7 and b[6] == 0:
+                        b_rect = fitz.Rect(b[:4])
+                        text = b[4].strip()
+                        
+                        search_zone = fitz.Rect(vlm_rect.x0 - 10, vlm_rect.y0 - 10, 
+                                                vlm_rect.x1 + 10, vlm_rect.y1 + 10)
+                        if b_rect.intersects(search_zone):
+                            is_hint_match = clean_hint != "unlabeled figure" and clean_hint in text.lower()
+                            is_labeled = text.lower().startswith(('figure', 'fig.', 'table', 'tab.'))
+                            is_short = text.count('\n') < 4
+                            
+                            is_noise = "www." in text.lower() or b_rect.y1 < 50 or b_rect.y0 > ph - 50
+                            
+                            if (is_hint_match or is_labeled) and is_short and not is_noise:
+                                caption_blocks.append(b_rect)
+         
+                if visual_objects:
+                    components = visual_objects + caption_blocks
+                    final_rect = components[0]
+                    for r in components[1:]: final_rect |= r
+                else:
+                    print(f"    ⚠ Skipping {caption_hint}: No visual anchor found (text-only).")
+                    continue
 
+                final_rect.y0 = max(0, final_rect.y0 - 5)
+                final_rect.y1 = min(ph, final_rect.y1 + 5)
+                final_rect.x0 = max(0, final_rect.x0 - 5)
+                final_rect.x1 = min(pw, final_rect.x1 + 5)
 
-                pix = page.get_pixmap(clip=final_rect, dpi=300)
-                safe_caption = re.sub(r'[\\/*?:"<>|]', '', caption_hint).strip()[:100]
-                if not safe_caption:
-                    safe_caption = f"fig_{section.section_id}_p{page_num}"
-                fig_name = f"{safe_caption}.png"
+                pix = page.get_pixmap(clip=final_rect, dpi=self.dpi)
+                str_hint = str(caption_hint)
+                safe_name = "".join([c for c in str_hint if c.isalnum() or c in (' ', '_', '-')]).strip()[:80]
+                if not safe_name or safe_name.lower() == "unlabeled figure":
+                    safe_name = f"fig_{section.section_id}_p{page_num}_{int(time.time()*1000)%1000}"
+                fig_name = f"{safe_name.replace(' ', '_')}.png"
 
                 fig_path = os.path.join(self.figures_dir, fig_name)
                 pix.save(fig_path)
@@ -282,9 +341,5 @@ class PDFExtractor:
                 globally_extracted.add(caption_hint)
                 print(f"    ✓ Visually extracted: {fig_name}")
 
-
-
-
     def close(self):
         self.doc.close()
-
