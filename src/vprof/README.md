@@ -1,8 +1,8 @@
-# 🎓 Virtual Professor (V-Prof) Pipeline
+# Virtual Professor (V-Prof) Pipeline
 
 The **Virtual Professor (V-Prof)** is an advanced multi-agent AI system designed to transform raw textbook content into structured, high-quality, and academically rigorous video lecture materials (PPT JSON).
 
-## 🏗️ Architecture
+## Architecture
 
 V-Prof follows an **Instructional Design Pipeline**, treating video generation as a multi-step educational process rather than a simple summarization task.
 
@@ -26,44 +26,14 @@ V-Prof follows an **Instructional Design Pipeline**, treating video generation a
     - **Tone**: Conversational, engaging, and professional (YouTube-style, like Computerphile).
     - **Output**: Technical script, extractive bullets, and smooth transitions.
 
-## 🚀 Getting Started
-
-### Prerequisites
-- Python 3.9+
-- CAMEL-AI framework
-- Google Gemini API Key
-
-### Installation
-1. Clone the repository.
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Set up your `.env` file in the project root:
-   ```env
-   GEMINI_API_KEY=your_api_key_here
-   ```
-
-## 🛠️ Usage
-
-The main entry point is `src/vprof/generator.py`. It orchestrates the entire flow from PDF extraction results to the final PPT JSON.
-
-```bash
-# Ensure your PYTHONPATH includes the src directory
-export PYTHONPATH=$PYTHONPATH:. 
-
-# Run the generator
-python -m src.vprof.generator
-```
-
-## 📄 Data Contract (PPT JSON)
+## Data Contract (PPT JSON)
 
 The pipeline produces a structured JSON output (`ppt_results.json`) that can be directly consumed by a frontend renderer or a PPTX automation script.
 
 ```json
 {
-  "lecture_id": "networks_ch1",
-  "title": "Computer Networks: Chapter 1",
+  "lecture_id": "Chapter_i",
+  "title": "slide title",
   "slides": [
     {
       "slide_idx": 1,
@@ -81,7 +51,7 @@ The pipeline produces a structured JSON output (`ppt_results.json`) that can be 
 }
 ```
 
-## 🎯 Design Principles
+## Design Principles
 - **Fidelity**: 100% extractive slide text ensures no AI-hallucinated technical errors.
 - **Engagement**: Scripts are written to feel like a real lecture, not a reading of the textbook.
 - **Cohesion**: Using a global chapter index allows the system to understand the context and flow of the entire lesson.
