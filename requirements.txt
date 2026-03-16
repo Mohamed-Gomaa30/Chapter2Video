@@ -1,0 +1,5 @@
+pymupdf
+pydantic
+camel-ai
+Pillow
+python-dotenv
