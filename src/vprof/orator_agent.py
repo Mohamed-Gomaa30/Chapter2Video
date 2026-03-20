@@ -7,7 +7,7 @@ import json
 
 class OratorAgent:
     def __init__(self, model_platform: ModelPlatformType = ModelPlatformType.GEMINI, 
-                 model_type: ModelType = ModelType.GEMINI_3_PRO):
+                 model_type: ModelType = ModelType.GEMINI_2_5_PRO):
         self.model = ModelFactory.create(
             model_platform=model_platform,
             model_type=model_type,
@@ -16,14 +16,15 @@ class OratorAgent:
             "You are a Technical Professor (The Orator Agent). "
             "Your task is to write the script and slide text for an academic video lecture. \n\n"
             "Style Guidelines:\n"
-            "1. Academic Rigor: Maintain technical precision. Use LaTeX for math. Use exact units.\n"
+            "1. Academic Rigor: Maintain technical precision. Use LaTeX for math (e.g., `$x^2$` or `$$E=mc^2$$`). These symbols will be preserved by the builder.\n"
             "2. Conversational Flow: Write like a professional YouTube educator (e.g., Computerphile). "
             "Use phrases like 'Let's dive into...', 'Notice on the diagram...', 'This brings us to...'\n"
             "3. Slide Logic (STRICT WORD-FOR-WORD EXTRACTION):\n"
             "   - Slide Format: Choose 'BulletPoints' or 'SingleText'.\n"
             "   - Content Quality: Slide text MUST be **Word-for-Word sentences or phrases** taken directly from the source text. NO Paraphrasing. NO adding words.\n"
             "   - **Vocabulary Priority**: You MUST include bold/italic technical terms from the source on the slide.\n"
-            "   - Limit: Max 5 bullets (if BulletPoints) and max 14 words per bullet/sentence.\n"
+            "   - Limit (BulletPoints): Min 3, Max 5 bullets. **Conciseness is CRITICAL**: For slides with figures (Mixed layout), keep each bullet to 1-2 lines maximum to avoid vertical overflow in the Beamer frame.\n"
+            "   - Limit (SingleText): Write an informative summary (at most 3 or 4 sentences OR equivalent content).\n"
             "   - DO NOT repeat content from previous slides.\n"
             "4. Script vs. Visuals: The visuals show the exact raw text; the script EXPLAINS them in a friendly, conversational tone.\n"
             "5. Visual Cues: Refer to figures consistently.\n\n"
@@ -57,6 +58,9 @@ class OratorAgent:
                 res_text = res_text.split("```json")[1].split("```")[0].strip()
             elif "```" in res_text:
                 res_text = res_text.split("```")[1].split("```")[0].strip()
-            return json.loads(res_text)
+            data = json.loads(res_text)
+            if isinstance(data, list):
+                return {"text": data, "script": res_text, "transition": "", "layout_type": "BulletPoints"}
+            return data
         except:
-            return {"bullets": [], "script": res_text, "transition": ""}
+            return {"text": [], "script": res_text, "transition": "", "layout_type": "BulletPoints"}

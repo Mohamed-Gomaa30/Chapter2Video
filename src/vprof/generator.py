@@ -1,13 +1,12 @@
 import json
 import os
-from typing import List, Dict
+from typing import List, Dict, Union
 from dotenv import load_dotenv
 from pathlib import Path
 from src.vprof.models import Lecture, Slide, SlideVisuals
 from src.vprof.allocation_agent import AllocationAgent
 from src.vprof.orator_agent import OratorAgent
 
-# Load .env from project root
 project_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(project_root / ".env")
 
@@ -29,7 +28,6 @@ class VProfGenerator:
         else:
             sections = data.get("sections", [])
             
-        # Read Chapter Outline from index file if provided
         chapter_outline = ""
         if index_path and os.path.exists(index_path):
             with open(index_path, 'r') as f:
@@ -41,7 +39,6 @@ class VProfGenerator:
         for section in sections:
             print(f"Processing Section: {section['section_id']} - {section['title']}")
             
-            # 1. Split section into Atomic Concepts with Chapter Context
             concepts = self.allocator.split_section(
                 section['title'], 
                 section['text'], 
@@ -50,15 +47,12 @@ class VProfGenerator:
                 current_section_id=section.get("section_id")
             )
             
-            # 2. Generate content for each concept
             is_first_slide = True
             section_bullets_history = []
             
             for concept in concepts:
-                # Pass history of text to avoid repetition
                 previous_context = "\n".join(section_bullets_history)
                 
-                # First slide of section prefers High-Impact SingleText
                 preferred_format = "SingleText" if is_first_slide else "BulletPoints"
                 
                 content_result = self.orator.generate_content(
@@ -69,51 +63,95 @@ class VProfGenerator:
                     preferred_format=preferred_format
                 )
                 
-                # Update history using the correct 'text' key
+                if not isinstance(content_result, dict):
+                    content_result = {"text": [], "script": str(content_result), "transition": "", "layout_type": "BulletPoints"}
+                
                 slide_text_list = content_result.get("text", [])
+                slide_text_list = self._flatten_text(slide_text_list)
                 section_bullets_history.extend(slide_text_list)
                 
-                # 3. Handle Visuals/Layout
-                figure_path = None
-                # Trust the agent's choice, but override if figures exist
-                suggested_layout = content_result.get("layout_type", "BulletPoints")
-                
-                if concept['figure_references']:
-                    figure_path = concept['figure_references'][0]
-                    layout_type = "Mixed_Horizontal"
+                figs = concept.get('figure_references', [])
+                if not figs:
+                    visuals = SlideVisuals(
+                        text=slide_text_list if slide_text_list else ["(No text)"],
+                        figure_path=None,
+                        layout_type=content_result.get("layout_type", "BulletPoints")
+                    )
+                    self._add_slide(section['title'] if is_first_slide else concept['concept_title'], 
+                                   visuals, content_result, is_first_slide)
+                    is_first_slide = False
                 else:
-                    layout_type = suggested_layout
+                    for i, fig in enumerate(figs):
+                        fig_path = fig['path'] if isinstance(fig, dict) else fig
+                        
+                        title = section['title'] if (is_first_slide and i == 0) else concept['concept_title']
+                        if i > 0:
+                            title = f"{title} (cont.)"
+                        
+                        visuals = SlideVisuals(
+                            text=slide_text_list if i == 0 else [f"Referencing: {os.path.basename(fig_path)}"],
+                            figure_path=fig_path,
+                            layout_type="Mixed_Horizontal"
+                        )
+                        self._add_slide(title, visuals, content_result, is_first_slide and i == 0)
+                        if i == 0: is_first_slide = False
 
-                visuals = SlideVisuals(
-                    text=slide_text_list if slide_text_list else ["(No text)"],
-                    figure_path=figure_path,
-                    layout_type=layout_type
-                )
-                
-                # First slide of the section gets the Section Title, others get Concept Title
-                slide_title = section['title'] if is_first_slide else concept['concept_title']
-                is_first_slide = False
-                
-                slide = Slide(
-                    slide_idx=self.slide_counter,
-                    concept=slide_title,
-                    format=layout_type,
-                    visuals=visuals,
-                    script=content_result.get("script", ""),
-                    transition=content_result.get("transition", "")
-                )
-                
-                self.slides.append(slide)
-                self.slide_counter += 1
+    def _add_slide(self, title: str, visuals: SlideVisuals, content_result: Dict, is_first: bool):
+        slide = Slide(
+            slide_idx=self.slide_counter,
+            concept=title,
+            format=visuals.layout_type,
+            visuals=visuals,
+            script=content_result.get("script", ""),
+            transition=content_result.get("transition", "")
+        )
+        self.slides.append(slide)
+        self.slide_counter += 1
+
+    def _flatten_text(self, text_items: List[Union[str, Dict]]) -> List[str]:
+        """Flattens structured content (headings/bullets) from LLM into a string list."""
+        flat = []
+        for item in text_items:
+            if isinstance(item, str):
+                flat.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") == "heading":
+                    flat.append(f"**{item.get('text', '')}**")
+                elif item.get("type") == "bullet_points":
+                    flat.extend(item.get("items", []))
+                elif "text" in item:
+                    flat.append(str(item["text"]))
+                else:
+                    flat.append(str(item))
+        return flat
 
     def save(self, output_path: str):
+        if self.slides and self.slides[-1].concept != "Conclusion":
+            conclusion_visuals = SlideVisuals(
+                text=[
+                    "Thank you for your attention!",
+                    "**Questions?** Feel free to reach out."
+                ],
+                figure_path=None,
+                layout_type="Text_Only"
+            )
+            conclusion_slide = Slide(
+                slide_idx=self.slide_counter,
+                concept="Conclusion",
+                format="Text_Only",
+                visuals=conclusion_visuals,
+                script="That concludes our lesson for today. Thank you for your time and attention. I'm happy to answer any questions you may have.",
+                transition="End of Lesson"
+            )
+            self.slides.append(conclusion_slide)
+            self.slide_counter += 1
+
         lecture = Lecture(
             lecture_id=self.lecture_id,
             title=self.title,
             slides=self.slides
         )
         
-        # Create output directory if it doesn't exist
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
         with open(output_path, 'w') as f:
@@ -122,10 +160,11 @@ class VProfGenerator:
         print(f"Lecture saved to {output_path}")
 
 if __name__ == "__main__":
-    gen = VProfGenerator("networks_ch1", "Computer Networks: Chapter 1")
+    gen = VProfGenerator("OS_Ch1.1", "Operating System: Chapter 1")
     gen.process_extraction(
         "./data/processed/os/extraction_results.json", 
-        index_path="./data/raw/os/os_chapter1_index.txt",
+        index_path="./data/raw/os/chapter1_index.txt",
         limit=3
     )
+    gen.save("./data/processed/os/ppt_results.json")
     gen.save("./data/processed/os/ppt_results.json")
