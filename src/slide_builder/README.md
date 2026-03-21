@@ -17,6 +17,16 @@ We use a **Binary Strategic Choice** approach for selecting the best layout for 
 2. **Binary MSTS Judge**: Both variants are rendered into 200 DPI images and presented to a Vision-Language Model (VLM).
 3. **Selection Logic**: The VLM selects the layout that provides the **largest visible figure** without causing "Overfull" (overflow) errors or colliding with the slide footer.
 
+## Artifact Generation
+
+The builder produces a complete, modular set of artifacts for downstream video production in the `stage4/` directory:
+
+| Artifact | Location | Description |
+| :--- | :--- | :--- |
+| **PNG Slides** | `figures/figureSlideN.png` | 300 DPI high-res extraction of every slide from the final PDF. |
+| **Speaker TXTs** | `scripts/scriptN.txt` | Individual narration files (VLM for Slide 1-2, Original for 3+). |
+| **Mapping JSON** | `ppt_mapping.json` | Master manifest linking each slide to its corresponding image and script. |
+
 ## Technical Constraints
 
 - **Dynamic Figure Height**: Vertically stacked figures use variable max-heights (0.4–0.6 `\textheight`) based on bullet count to prevent footer collisions.
