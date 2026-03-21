@@ -160,7 +160,6 @@ class VProfSliderBuilder:
         if not fig_path or not os.path.exists(fig_path):
             return self.coder.generate_frame(slide_data)
 
-        # 1. Generate 2 variants: A (Horizontal) and B (Vertical)
         labels = ["A", "B", "C", "D"] # Standard labels, but we only use A and B
         variants_code = []
         image_paths = []
@@ -220,6 +219,86 @@ class VProfSliderBuilder:
         except Exception as e:
             print(f"    [Binary Choice] Judge failed: {e}. Defaulting to Horizontal (A).")
             return variants_code[0]
+
+    def _concat_images_2x1(self, image_paths: List[Optional[str]], output_path: str,
+                            labels: List[str] = None):
+        """Concatenates 2 images side-by-side (2 columns, 1 row)."""
+        valid_p = next((p for p in image_paths if p), None)
+        if not valid_p:
+            print("    [ERROR] No valid variants to render 2x1 grid.")
+            return
+
+        with Image.open(valid_p) as first_img:
+            w, h = first_img.size
+        
+        label_height = 40
+        grid = Image.new("RGB", (w * 2, h + label_height), (240, 240, 240))
+        draw = ImageDraw.Draw(grid)
+        
+        for idx in range(2):
+            x_off = idx * w
+            y_off = label_height
+            
+            p = image_paths[idx] if idx < len(image_paths) else None
+            if p and os.path.exists(p):
+                with Image.open(p).convert("RGB") as img:
+                    grid.paste(img, (x_off, y_off))
+            else:
+                placeholder = Image.new("RGB", (w, h), (30, 30, 30))
+                grid.paste(placeholder, (x_off, y_off))
+                draw.text((x_off + w // 2, y_off + h // 2), "FAILED", fill=(200, 0, 0), anchor="mm")
+
+            if labels and idx < len(labels):
+                badge_box = [x_off, 0, x_off + w, label_height]
+                draw.rectangle(badge_box, fill=(20, 40, 100))
+                draw.text((x_off + w // 2, label_height // 2), labels[idx], fill=(255, 220, 60), anchor="mm")
+        
+        grid.save(output_path)
+        print(f"    2x1 Grid saved: {output_path}")
+
+    def _render_variant_to_image(self, frame_code: str, tag: str) -> Optional[str]:
+        """Compiles a single Beamer frame to a temp PDF and converts page 0 to PNG."""
+        temp_tex = (
+            "\\documentclass{beamer}\n"
+            "\\usetheme{Madrid}\n"
+            "\\usepackage{graphicx}\n"
+            "\\usepackage{amsmath}\n"
+            "\\begin{document}\n"
+            f"{frame_code}\n"
+            "\\end{document}"
+        )
+        tex_path = os.path.join(self.temp_dir, f"variant_{tag}.tex")
+        pdf_path = tex_path.replace(".tex", ".pdf")
+        png_path = tex_path.replace(".tex", ".png")
+
+        with open(tex_path, 'w') as f:
+            f.write(temp_tex)
+
+        try:
+            cmd = [
+                "pdflatex",
+                "-interaction=nonstopmode",
+                "-output-directory", self.temp_dir,
+                tex_path
+            ]
+            subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+            if os.path.exists(pdf_path):
+                doc = fitz.open(pdf_path)
+                if doc.page_count > 1:
+                    print(f"    [FAIL] Variant '{tag}' produced {doc.page_count} pages (OVERFLOW). Skipping.")
+                    doc.close()
+                    return None
+                
+                page = doc.load_page(0)
+                pix = page.get_pixmap(matrix=fitz.Matrix(200 / 72, 200 / 72))
+                pix.save(png_path)
+                doc.close()
+                return png_path
+        except Exception as e:
+            print(f"    Rendering failed for variant '{tag}': {e}")
+
+        return None
 
     def _save_and_compile(self, ppt_json_path: str) -> str:
         full_latex = (
@@ -294,14 +373,12 @@ class VProfSliderBuilder:
         lines = log.splitlines()
         for i, line in enumerate(lines):
             if line.startswith("!"):
-                # Scan ahead up to 5 lines to find the 'l.[line]' indicator
                 for j in range(1, 6):
                     if i + j < len(lines) and lines[i + j].strip().startswith("l."):
                         try:
-                            # Extract line number from "l.67 \end{frame}"
                             parts = lines[i + j].strip().split()
                             if parts:
-                                line_num_str = parts[0][2:] # Strip 'l.'
+                                line_num_str = parts[0][2:]
                                 line_num = int(line_num_str)
                                 errors.append({"line": line_num, "msg": line})
                                 break
