@@ -108,43 +108,112 @@ class VProfSliderBuilder:
     def build_presentation(self, ppt_json_path: str, index_path: str,
                            professor_name: str = "Virtual Professor",
                            affiliation: str = "V-Prof AI Lab",
-                           date: str = "\\today") -> str:
+                           date: str = "\\today",
+                           limit: int = None) -> str:
         with open(ppt_json_path, 'r') as f:
             data = json.load(f)
 
         lecture_title = data.get("title", "Lecture")
-        lecture_title = self._sanitize_latex_data(lecture_title)
+        self.lecture_title = self._sanitize_latex_data(lecture_title)
+        lecture_title = self.lecture_title
         self.preamble = self.generate_preamble(lecture_title, professor_name, date, affiliation)
         self.toc = self.generate_toc(index_path)
 
         slides = data.get("slides", [])
-        self.frames = []
+        
+        # 1. Detect and Inject System Slides if missing
+        has_title = any(s.get("format") == "Title" or "Title" in s.get("concept", "") for s in slides[:2])
+        has_toc = any("Outline" in s.get("concept", "") for s in slides[:3])
 
+        if not has_title:
+            print("  Injecting Title Slide...")
+            slides.insert(0, {
+                "slide_idx": 0,
+                "concept": "Title Slide",
+                "format": "Title",
+                "visuals": {"text": [self.lecture_title, professor_name], "layout_type": "Title"},
+                "script": ""
+            })
+
+        if not has_toc and index_path and os.path.exists(index_path):
+            print("  Injecting TOC Slide...")
+            with open(index_path, 'r', encoding='utf-8') as f:
+                outline = [line.strip() for line in f.readlines() if line.strip()][:10]
+            slides.insert(1, {
+                "slide_idx": 0,
+                "concept": "Chapter Outline",
+                "format": "BulletPoints",
+                "visuals": {"text": outline, "layout_type": "BulletPoints"},
+                "script": ""
+            })
+
+        # Re-index slides to ensure continuity
+        for i, s in enumerate(slides):
+            s["slide_idx"] = i + 1
+
+        if limit:
+            slides = slides[:limit]
+
+        # 2. Disable manual Title/TOC in preamble to avoid duplication in PDF
+        self.preamble = self.preamble.replace("\\begin{frame}\n  \\titlepage\n\\end{frame}", "% Injected via Slides List")
+        self.toc = "% Injected via Slides List"
+
+        self.frames = []
         for slide_orig in slides:
             slide = self._sanitize_latex_data(slide_orig)
-            print(f"Processing Slide {slide['slide_idx']}: {slide['concept']}")
+            slide_idx = slide.get('slide_idx', 0)
+            print(f"Processing Slide {slide_idx}: {slide['concept']}")
 
             visuals = slide.get("visuals", {})
             fig_path_raw = visuals.get("figure_path", "")
             
+            # Resolve fig_path
             fig_path = fig_path_raw
             if self.project_root and fig_path and not os.path.isabs(fig_path):
                 fig_path = os.path.join(self.project_root, fig_path)
 
+            frame_code = ""
             if fig_path and os.path.exists(fig_path):
                 slide["visuals"]["figure_path"] = os.path.abspath(fig_path)
-                print(f"  Figure detected: {slide['visuals']['figure_path']}. Running MSTS-8 VLM layout selection...")
-                best_code = self.select_best_layout_with_vlm(slide)
-                best_code = self._strip_animations(best_code)
-                self.frames.append({"data": slide, "code": best_code})
+                print(f"  Figure detected. Running Binary VLM selection...")
+                frame_code = self.select_best_layout_with_vlm(slide)
             else:
-                if fig_path_raw:
-                    print(f"  WARNING: Figure path not found: {fig_path}")
                 frame_code = self.coder.generate_frame(slide)
-                frame_code = self._strip_animations(frame_code)
-                self.frames.append({"data": slide, "code": frame_code})
+            
+            frame_code = self._strip_animations(frame_code)
+            
+            # Visual Narration for System Slides (Title/TOC)
+            if 1 <= slide_idx <= 2:
+                print(f"  [Visual Narration] Generating script for Slide {slide_idx}...")
+                img_path = self._render_variant_to_image(frame_code, f"system_{slide_idx}")
+                if img_path:
+                    slide["script"] = self._generate_visual_narration(img_path, slide_idx)
+            else:
+                print(f"  [Original Script] Preserving JSON script for Slide {slide_idx}.")
+            
+            self.frames.append({"data": slide, "code": frame_code})
 
         return self._save_and_compile(ppt_json_path)
+
+    def _generate_visual_narration(self, image_path: str, slide_idx: int) -> str:
+        """Uses VLM to 'see' the slide and write an engaging script."""
+        prompt = (
+            "You are a professional Virtual Professor narrating a video lecture.\n"
+            f"Slide Type: {'Title Page' if slide_idx == 1 else 'Chapter Outline'}\n\n"
+            "TASK: Write a high-energy, engaging narration script for this slide.\n"
+            "- If Title: Welcome viewers with 'Hello everyone, I am your Virtual Professor...', and introduce the topic with enthusiasm.\n"
+            "- If Outline: Briefly mention the key milestones we will cover today.\n"
+            "Return ONLY the plain script text. No meta-commentary."
+        )
+        try:
+            with Image.open(image_path) as img:
+                user_msg = BaseMessage.make_user_message(role_name="User", content=prompt, image_list=[img])
+                agent = ChatAgent(system_message="You are a professional academic narrator.", model=self.vlm_model)
+                response = agent.step(user_msg)
+                return response.msgs[0].content.strip()
+        except Exception as e:
+            print(f"    [Visual Narration] Failed for Slide {slide_idx}: {e}")
+            return "Welcome to our lecture today."
 
     # ─────────────────────────────────────────────────────────────────────────
     # Binary MSTS Judge
@@ -308,12 +377,77 @@ class VProfSliderBuilder:
             + "\n\\end{document}"
         )
 
-        tex_filename = os.path.basename(ppt_json_path).replace(".json", ".tex")
-        tex_path = os.path.join(self.output_dir, tex_filename)
+        base_name = os.path.basename(ppt_json_path).replace(".json", "")
+        tex_path = os.path.join(self.output_dir, f"{base_name}.tex")
         with open(tex_path, 'w') as f:
             f.write(full_latex)
+        print(f"  LaTeX file generated: {tex_path}")
 
-        print(f"LaTeX file generated: {tex_path}")
+        # 1. Compile to PDF (required for page extraction)
+        pdf_path = tex_path.replace(".tex", ".pdf")
+        success = self.compile_tex(tex_path)
+
+        # 2. Stage 4 Artifacts (Figures, Scripts, Mapping)
+        stage4_dir = os.path.join(self.output_dir, "stage4")
+        fig_dir = os.path.join(stage4_dir, "figures")
+        script_dir = os.path.join(stage4_dir, "scripts")
+        
+        os.makedirs(fig_dir, exist_ok=True)
+        os.makedirs(script_dir, exist_ok=True)
+
+        mapping_data = []
+        
+        if success and os.path.exists(pdf_path):
+            print(f"  [Stage 4] Extracting images and scripts...")
+            try:
+                doc = fitz.open(pdf_path)
+                for i, frame in enumerate(self.frames):
+                    slide_num = i + 1
+                    
+                    # A. Extract Slide Image
+                    img_name = f"figureSlide{slide_num}.png"
+                    img_path = os.path.join(fig_dir, img_name)
+                    if i < len(doc):
+                        page = doc.load_page(i)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72))
+                        pix.save(img_path)
+                    
+                    # B. Save Slide Script
+                    script_name = f"script{slide_num}.txt"
+                    script_path = os.path.join(script_dir, script_name)
+                    script_content = frame['data'].get('script', '')
+                    with open(script_path, 'w') as f:
+                        f.write(script_content)
+
+                    # C. Add to Mapping
+                    rel_img = os.path.relpath(img_path, self.project_root) if self.project_root else img_path
+                    rel_script = os.path.relpath(script_path, self.project_root) if self.project_root else script_path
+                    
+                    mapping_data.append({
+                        "slide_num": slide_num,
+                        "slide_page_path": rel_img,
+                        "slide_script_path": rel_script
+                    })
+                doc.close()
+            except Exception as e:
+                print(f"  [Stage 4] PDF Extraction error: {e}")
+
+            # D. Save Master Mapping JSON
+            mapping_json_path = os.path.join(stage4_dir, "ppt_mapping.json")
+            with open(mapping_json_path, 'w') as f:
+                json.dump(mapping_data, f, indent=4)
+            print(f"  [Stage 4] Master mapping generated: {mapping_json_path}")
+
+        # 3. Save Final Enriched JSON (Existing legacy support)
+        final_json_path = os.path.join(self.output_dir, f"{base_name}_final.json")
+        final_data = {
+            "title": getattr(self, "lecture_title", "Lecture"),
+            "slides": [f['data'] for f in self.frames],
+            "stage4_mapping": mapping_data
+        }
+        with open(final_json_path, 'w') as f:
+            json.dump(final_data, f, indent=4)
+
         return tex_path
 
     def compile_tex(self, tex_path: str, max_retries: int = 3):
